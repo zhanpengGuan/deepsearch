@@ -1,12 +1,14 @@
 import json
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TypedDict, Annotated, List, Optional
 import operator
 
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
-from duckduckgo_search import DDGS
+import requests
 
 load_dotenv()
 
@@ -28,16 +30,29 @@ llm = ChatOpenAI(
     base_url="https://api.deepseek.com",
     api_key=os.getenv("DEEPSEEK_API_KEY"),
 )
+llm_fast = ChatOpenAI(
+    model="deepseek-v4-flash",
+    base_url="https://api.deepseek.com",
+    api_key=os.getenv("DEEPSEEK_API_KEY"),
+)
 
 # ---- Tool ----
+SERPER_API_KEY = os.getenv("SERPER_API_KEY")
+
 def search_web(query: str, num_results: int = 5) -> List[dict]:
-    """返回搜索结果列表，每条包含 title, url, snippet"""
-    with DDGS() as ddgs:
-        results = list(ddgs.text(query, max_results=num_results))
-        return [
-            {"title": r["title"], "url": r["href"], "snippet": r["body"]}
-            for r in results
-        ]
+    """通过 Serper (Google) 搜索，返回 title, url, snippet"""
+    resp = requests.post(
+        "https://google.serper.dev/search",
+        headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+        json={"q": query, "num": num_results},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return [
+        {"title": r["title"], "url": r["link"], "snippet": r.get("snippet", "")}
+        for r in data.get("organic", [])
+    ]
 
 # ---- Prompts ----
 INITIAL_QUERY_PROMPT = """你是一个研究助理。请为以下问题生成2-3个精准的搜索查询，用换行分隔：
@@ -77,6 +92,9 @@ REFLECT_PROMPT = """作为严苛的评审，请评估以下答案。判断它是
 
 # ---- Nodes ----
 def generate_query(state: ResearchState) -> dict:
+    t0 = time.perf_counter()
+    print(f"\n{'='*50}")
+    print(f"[generate_query] 第 {state['iteration']+1} 轮 · 生成搜索关键词...")
     if not state["queries"]:
         prompt = INITIAL_QUERY_PROMPT.format(question=state["question"])
     else:
@@ -86,25 +104,36 @@ def generate_query(state: ResearchState) -> dict:
             queries=state["queries"],
             feedback=feedback,
         )
-    response = llm.invoke(prompt)
+    response = llm_fast.invoke(prompt)
     new_queries = [q.strip() for q in response.content.split("\n") if q.strip()]
+    print(f"  新 query: {new_queries}")
+    print(f"  耗时: {time.perf_counter() - t0:.1f}s")
     return {"queries": new_queries, "iteration": state["iteration"] + 1}
 
 def search(state: ResearchState) -> dict:
+    t0 = time.perf_counter()
     searched = state.get("searched_count", 0)
-    new_queries = state["queries"][searched:]  # 只搜索本轮新增的 query
+    new_queries = state["queries"][searched:]
+
+    print(f"[search] 搜索 {len(new_queries)} 个 query (并行)...")
     new_results = []
-    for q in new_queries:
-        try:
-            new_results.extend(search_web(q))
-        except Exception:
-            continue
+    with ThreadPoolExecutor(max_workers=len(new_queries)) as executor:
+        futures = {executor.submit(search_web, q): q for q in new_queries}
+        for future in as_completed(futures):
+            try:
+                new_results.extend(future.result())
+            except Exception as e:
+                print(f"  [warn] 搜索失败: {futures[future]} — {e}")
+    print(f"  获取 {len(new_results)} 条结果")
+    print(f"  耗时: {time.perf_counter() - t0:.1f}s")
     return {
         "search_results": new_results,
         "searched_count": len(state["queries"]),
     }
 
 def generate_answer(state: ResearchState) -> dict:
+    t0 = time.perf_counter()
+    print(f"[generate_answer] 基于 {len(state['search_results'])} 条搜索结果生成答案...")
     context_parts = []
     for i, res in enumerate(state["search_results"]):
         context_parts.append(
@@ -113,19 +142,26 @@ def generate_answer(state: ResearchState) -> dict:
     context = "\n".join(context_parts)
     prompt = ANSWER_PROMPT.format(question=state["question"], context=context)
     response = llm.invoke(prompt)
+    print(f"  耗时: {time.perf_counter() - t0:.1f}s")
     return {"answer": response.content}
 
 def reflect(state: ResearchState) -> dict:
+    t0 = time.perf_counter()
+    print(f"[reflect] 评估答案...")
     prompt = REFLECT_PROMPT.format(
         question=state["question"], answer=state["answer"]
     )
-    response = llm.invoke(prompt)
+    response = llm_fast.invoke(prompt)
     try:
         result = json.loads(response.content)
     except (json.JSONDecodeError, KeyError):
         result = {"is_satisfactory": False, "feedback": "无法解析评估结果，请重新搜索"}
+    is_satisfied = result.get("is_satisfactory", False)
+    status = "通过" if is_satisfied else "需改进"
+    print(f"  评估结果: {status}")
+    print(f"  耗时: {time.perf_counter() - t0:.1f}s")
     return {
-        "is_satisfactory": result.get("is_satisfactory", False),
+        "is_satisfactory": is_satisfied,
         "reflection_feedback": result.get("feedback", ""),
     }
 
@@ -168,8 +204,15 @@ if __name__ == "__main__":
         "max_iterations": 3,
         "searched_count": 0,
     }
+
+    print(f"问题: {initial_state['question']}")
+    t_start = time.perf_counter()
+
     final_state = app.invoke(initial_state)
 
-    print("最终答案：")
+    print(f"\n{'='*50}")
+    print(f"总耗时: {time.perf_counter() - t_start:.1f}s")
+    print(f"迭代次数: {final_state['iteration']}")
+    print(f"最终答案：")
     print(final_state["answer"])
     print("\n搜索历史：", final_state["queries"])
